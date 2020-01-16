@@ -24,7 +24,8 @@ const createHeader = n => {
 
 const createDirectory = (data, offset) => {
 	const buf = bufferAlloc(constants.directorySize);
-	const size = data.data.length + constants.bitmapSize;
+	const mask = (data.bpp === 4) ? (getMaskScanWidth(data.width) * data.height) : 0;
+	const size = data.data.length + constants.bitmapSize + mask;
 	const width = data.width === 256 ? 0 : data.width;
 	const height = data.height === 256 ? 0 : data.height;
 	const bpp = data.bpp * 8;
@@ -38,7 +39,7 @@ const createDirectory = (data, offset) => {
 	buf.writeUInt32LE(size, 8);
 	buf.writeUInt32LE(offset, 12);
 
-	return buf;
+	return { buf, size };
 };
 
 const createBitmap = (data, compression) => {
@@ -86,6 +87,41 @@ const createDib = (data, width, height, bpp) => {
 	return buf;
 };
 
+const getMaskScanWidth = width => ((width + 31) >> 5) << 2;
+
+const createMask = (data, width, height, threshold) => {
+	const scanWidth = getMaskScanWidth(width);
+	const buf = bufferAlloc(scanWidth * height);
+	
+	for (let y = 0, srcPos = 3; y < height; ++y) {
+		let dstPos = y * scanWidth;
+		
+		for (let x = 0; x < width - 7; x += 8, srcPos += 32) {
+			const mask = (data.readUInt8(srcPos) >= threshold ? 0 : 0x80) |
+				(data.readUInt8(srcPos + 4) >= threshold ? 0 : 0x40) |
+				(data.readUInt8(srcPos + 8) >= threshold ? 0 : 0x20) |
+				(data.readUInt8(srcPos + 12) >= threshold ? 0 : 0x10) |
+				(data.readUInt8(srcPos + 16) >= threshold ? 0 : 0x8) |
+				(data.readUInt8(srcPos + 20) >= threshold ? 0 : 0x4) |
+				(data.readUInt8(srcPos + 24) >= threshold ? 0 : 0x2) |
+				(data.readUInt8(srcPos + 28) >= threshold ? 0 : 0x1);
+			buf.writeUInt8(mask, dstPos++);
+		}
+		
+		if (width % 8) {
+			let mask = 0;
+			
+			for (let x = 0; x < (width % 8); ++x, srcPos += 4) {
+				mask |= (data.readUInt8(srcPos) >= threshold ? 0: Math.pow(2, 7 - x));
+			}
+			
+			buf.writeUInt8(mask, dstPos);
+		}
+	}
+	
+	return buf;
+};
+
 const generateIco = data => {
 	return Promise.all(data.map(x => parsePng(x))).then(data => {
 		const header = createHeader(data.length);
@@ -96,16 +132,17 @@ const generateIco = data => {
 
 		for (const x of data) {
 			const dir = createDirectory(x, offset);
-			arr.push(dir);
-			len += dir.length;
-			offset += x.data.length + constants.bitmapSize;
+			arr.push(dir.buf);
+			len += dir.buf.length;
+			offset += dir.size;
 		}
 
 		for (const x of data) {
 			const header = createBitmap(x, constants.colorMode);
 			const dib = createDib(x.data, x.width, x.height, x.bpp);
-			arr.push(header, dib);
-			len += header.length + dib.length;
+			const mask = (x.bpp === 4) ? createMask(dib, x.width, x.height, 1) : bufferAlloc(0);
+			arr.push(header, dib, mask);
+			len += header.length + dib.length + mask.length;
 		}
 
 		return Buffer.concat(arr, len);
